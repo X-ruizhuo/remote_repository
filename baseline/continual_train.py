@@ -446,5 +446,7 @@ if __name__ == '__main__':
     parser.add_argument('--weight_anti', type=float, default=1, help='weight for anti_forget loss')
     parser.add_argument('--weight_discri', type=float, default=0.007, help='weight for anti_discrimination loss')
     parser.add_argument('--weight_transx', type=float, default=0.0005, help='weight for transformation_x loss')
+    parser.add_argument('--weight_brrd', type=float, default=1.0, help='weight for bidirectional rectified relation distillation loss')
+    parser.add_argument('--disable_brrd', action='store_true', help='disable bidirectional rectified relation distillation')
     
     main()
