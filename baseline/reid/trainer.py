@@ -36,6 +36,9 @@ class Trainer(object):
         self.weight_discri = args.weight_discri
         self.weight_transx = args.weight_transx
         self.weight_brrd = args.weight_brrd
+        self.brrd_rho = args.brrd_rho
+        self.brrd_warmup_epoch = args.brrd_warmup_epoch
+        self.brrd_no_detach = args.brrd_no_detach
         self.disable_brrd = args.disable_brrd
 
     def loss_cr(self, targets_, s_features_old_, trans_old_features_norm_):
@@ -119,17 +122,6 @@ class Trainer(object):
                 trans_new_features = self.model_trans2(s_features)
                 trans_new_features_norm = F.normalize(trans_new_features, p=2, dim=1)
 
-                if not self.disable_brrd:
-                    brrd_loss = self.weight_brrd * self.loss_brrd(
-                        targets,
-                        Affinity_matrix_old.detach(),
-                        Affinity_matrix_new.detach(),
-                        trans_old_features_norm,
-                        trans_new_features_norm,
-                    )
-                    losses_brrd.update(brrd_loss.item())
-                    loss = loss + brrd_loss
-                
                 trans_loss = self.weight_trans * self.criterion_transform(trans_old_features_norm, s_features)\
                            + self.weight_trans * self.criterion_transform(trans_new_features_norm, s_features_old)
                 losses_ca.update(trans_loss.item())
@@ -166,6 +158,15 @@ class Trainer(object):
                 losses_dc.update(trans_x_loss.item())
                 
                 loss = loss + trans_loss + anti_loss + discri_loss + trans_x_loss
+
+                if not self.disable_brrd and epoch >= self.brrd_warmup_epoch:
+                    brrd_loss = self.weight_brrd * self.loss_brrd(
+                        targets,
+                        s_features_old,
+                        s_features,
+                    )
+                    losses_brrd.update(brrd_loss.item())
+                    loss = loss + brrd_loss
                 
             optimizer.zero_grad()
             loss.backward()
@@ -187,7 +188,7 @@ class Trainer(object):
                           global_step=epoch * train_iters + i)
                 self.writer.add_scalar(tag="loss/Loss_dc_{}".format(training_phase), scalar_value=losses_dc.val,
                           global_step=epoch * train_iters + i)
-                self.writer.add_scalar(tag="loss/Loss_brrd_{}".format(training_phase), scalar_value=losses_brrd.val,
+                self.writer.add_scalar(tag="loss/Loss_brrd_v2_{}".format(training_phase), scalar_value=losses_brrd.val,
                           global_step=epoch * train_iters + i)
                 self.writer.add_scalar(tag="time/Time_{}".format(training_phase), scalar_value=batch_time.val,
                           global_step=epoch * train_iters + i)
@@ -201,7 +202,7 @@ class Trainer(object):
                       'Loss_cr {:.3f} ({:.3f})\t'
                       'Loss_ad {:.3f} ({:.3f})\t'
                       'Loss_dc {:.3f} ({:.3f})\t'
-                      'Loss_brrd {:.3f} ({:.3f})\t'
+                      'Loss_brrd_v2 {:.3f} ({:.3f})\t'
                       .format(epoch, i + 1, train_iters,
                               batch_time.val, batch_time.avg,
                               losses_ce.val, losses_ce.avg,
@@ -217,7 +218,17 @@ class Trainer(object):
         pre_matrix_origin=cosine_similarity(x,x)
         pre_affinity_matrix=F.softmax(pre_matrix_origin/Norm, dim=1)
         return pre_affinity_matrix
-    def rectify_relation(self, relation, targets, eps=1e-12):
+    def get_brrd_affinity(self, x, Norm=0.1, mask_diag=True, eps=1e-12):
+        relation = cosine_similarity(x, x)
+        relation = F.softmax(relation / Norm, dim=1)
+        if mask_diag and relation.size(0) > 1:
+            eye = torch.eye(relation.size(0), dtype=torch.bool, device=relation.device)
+            relation = relation.masked_fill(eye, 0)
+            relation = relation / relation.sum(dim=1, keepdim=True).clamp_min(eps)
+        return relation
+    def rectify_relation(self, relation, targets, rho=None, eps=1e-12):
+        if rho is None:
+            rho = self.brrd_rho
         targets = targets.reshape(-1, 1)
         pos_mask = (targets == targets.T)
         neg_mask = ~pos_mask
@@ -236,16 +247,33 @@ class Trainer(object):
         rectified = torch.where(pos_mask, torch.maximum(relation, sp), torch.minimum(relation, sn))
         rectified = torch.clamp(rectified, min=eps)
         rectified = rectified / rectified.sum(dim=1, keepdim=True).clamp_min(eps)
-        return rectified
-    def loss_brrd(self, targets, affinity_old, affinity_new, trans_old_features_norm, trans_new_features_norm):
+        rho = max(0.0, min(1.0, float(rho)))
+        soft_rectified = (1 - rho) * relation + rho * rectified
+        soft_rectified = soft_rectified / soft_rectified.sum(dim=1, keepdim=True).clamp_min(eps)
+        return soft_rectified
+    def loss_brrd(self, targets, s_features_old, s_features):
+        if self.brrd_no_detach:
+            old_source = s_features_old
+            new_source = s_features
+        else:
+            old_source = s_features_old.detach()
+            new_source = s_features.detach()
+
+        affinity_old = self.get_brrd_affinity(old_source)
+        affinity_new = self.get_brrd_affinity(new_source)
         old_target = self.rectify_relation(affinity_old, targets).detach()
         new_target = self.rectify_relation(affinity_new, targets).detach()
 
-        affinity_trans_old = self.get_normal_affinity(trans_old_features_norm)
-        affinity_trans_new = self.get_normal_affinity(trans_new_features_norm)
+        trans_old_features = self.model_trans(old_source)
+        trans_new_features = self.model_trans2(new_source)
+        trans_old_features_norm = F.normalize(trans_old_features, p=2, dim=1)
+        trans_new_features_norm = F.normalize(trans_new_features, p=2, dim=1)
 
-        old_to_new = self.KLDivLoss(torch.log(affinity_trans_old.clamp_min(1e-12)), old_target)
-        new_to_old = self.KLDivLoss(torch.log(affinity_trans_new.clamp_min(1e-12)), new_target)
+        affinity_old_to_new = self.get_brrd_affinity(trans_old_features_norm)
+        affinity_new_to_old = self.get_brrd_affinity(trans_new_features_norm)
+
+        old_to_new = self.KLDivLoss(torch.log(affinity_old_to_new.clamp_min(1e-12)), new_target)
+        new_to_old = self.KLDivLoss(torch.log(affinity_new_to_old.clamp_min(1e-12)), old_target)
         return old_to_new + new_to_old
     def _parse_data(self, inputs):
         imgs, _, pids, cids, domains = inputs

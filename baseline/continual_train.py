@@ -52,6 +52,17 @@ def main():
     cfg.merge_from_file(args.config_file)
     main_worker(args, cfg)
 
+def get_brrd_log_summary(args):
+    if args.disable_brrd:
+        return 'BRRD-v2 Config: enabled=False'
+    return ('BRRD-v2 Config: enabled=True, weight={:.4f}, rho={:.4f}, '
+            'warmup_epoch={}, detach_backbone={}, target=cross-space, '
+            'diag=masked, rectification=soft').format(
+                args.weight_brrd,
+                args.brrd_rho,
+                args.brrd_warmup_epoch,
+                not args.brrd_no_detach,
+            )
 
 def main_worker(args, cfg):
     log_name = 'log.txt'
@@ -61,8 +72,11 @@ def main_worker(args, cfg):
         log_dir = osp.dirname(args.test_folder)
         sys.stdout = Logger(osp.join(log_dir, log_name))
     print("==========\nArgs:{}\n==========".format(args))
+    brrd_log_summary = get_brrd_log_summary(args)
+    print(brrd_log_summary)
     log_res_name='log_res.txt'
     logger_res=Logger_res(osp.join(args.logs_dir, log_res_name))
+    logger_res.append(brrd_log_summary)
     
 
     """
@@ -446,7 +460,10 @@ if __name__ == '__main__':
     parser.add_argument('--weight_anti', type=float, default=1, help='weight for anti_forget loss')
     parser.add_argument('--weight_discri', type=float, default=0.007, help='weight for anti_discrimination loss')
     parser.add_argument('--weight_transx', type=float, default=0.0005, help='weight for transformation_x loss')
-    parser.add_argument('--weight_brrd', type=float, default=1.0, help='weight for bidirectional rectified relation distillation loss')
+    parser.add_argument('--weight_brrd', type=float, default=0.1, help='weight for bidirectional rectified relation distillation loss')
+    parser.add_argument('--brrd_rho', type=float, default=0.3, help='soft rectification ratio for bidirectional rectified relation distillation')
+    parser.add_argument('--brrd_warmup_epoch', type=int, default=10, help='number of epochs to skip BRRD at each incremental step')
+    parser.add_argument('--brrd_no_detach', action='store_true', help='allow BRRD gradients to update the feature extractor')
     parser.add_argument('--disable_brrd', action='store_true', help='disable bidirectional rectified relation distillation')
     
     main()
